@@ -3,6 +3,7 @@ package maintenance
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -150,6 +151,13 @@ func (IssueCounterDrift) Step(ctx context.Context, tx pgx.Tx, j Job) (json.RawMe
 		return nil, nil, nil, false, err
 	}
 	var lastID string
+	type driftTarget struct {
+		id        string
+		counter   int
+		maxNumber int
+		gap       int
+	}
+	var targets []driftTarget
 	for rows.Next() {
 		var id string
 		var counter, maxNumber int
@@ -172,23 +180,7 @@ func (IssueCounterDrift) Step(ctx context.Context, tx pgx.Tx, j Job) (json.RawMe
 			progress.DetailsTruncated = true
 		}
 		if !j.DryRun {
-			// HealIssueCounter is the repair the merged collision handler uses, so the
-			// report and the repair cannot disagree about what "behind" means. Its WHERE
-			// guard only writes a counter that is really behind and returns the value it
-			// replaced, which is what lets this line record before and after.
-			uid, e := util.ParseUUID(id)
-			if e != nil {
-				err = e
-				break
-			}
-			row, e := db.New(tx).HealIssueCounter(ctx, uid)
-			if e != nil {
-				err = e
-				break
-			}
-			progress.WorkspacesRepaired++
-			slog.Info("maintenance counter repair", "job_id", j.ID, "workspace_id", id,
-				"previous_counter", row.PreviousCounter, "issue_counter", row.IssueCounter, "max_number", row.MaxNumber)
+			targets = append(targets, driftTarget{id, counter, maxNumber, gap})
 		}
 	}
 	rowErr := rows.Err()
@@ -198,6 +190,31 @@ func (IssueCounterDrift) Step(ctx context.Context, tx pgx.Tx, j Job) (json.RawMe
 	}
 	if rowErr != nil {
 		return nil, nil, nil, false, rowErr
+	}
+	// Repairs happen after the page is closed: pgconn serves one operation at a
+	// time, so writing while its own result set is still open fails the batch. The
+	// repair set is every drifted workspace in the page, not the capped report
+	// detail. HealIssueCounter is the repair the merged collision handler uses, so
+	// report and repair cannot disagree about what "behind" means, and its WHERE
+	// guard returns no row for a counter that is no longer behind — a workspace the
+	// request path already healed is left alone rather than failing the job.
+	if !j.DryRun {
+		for _, target := range targets {
+			uid, e := util.ParseUUID(target.id)
+			if e != nil {
+				return nil, nil, nil, false, e
+			}
+			row, e := db.New(tx).HealIssueCounter(ctx, uid)
+			if errors.Is(e, pgx.ErrNoRows) {
+				continue
+			}
+			if e != nil {
+				return nil, nil, nil, false, e
+			}
+			progress.WorkspacesRepaired++
+			slog.Info("maintenance counter repair", "job_id", j.ID, "workspace_id", target.id,
+				"previous_counter", row.PreviousCounter, "issue_counter", row.IssueCounter, "max_number", row.MaxNumber)
+		}
 	}
 	if lastID == "" {
 		report := counterDriftReport{DryRun: j.DryRun, Repair: p.Repair, CheckedAt: time.Now().UTC()}
