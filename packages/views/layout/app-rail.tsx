@@ -16,6 +16,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { CheckCheck, ExternalLink, Link2, RotateCcw, Settings, Users, type IconComponent } from "@multica/ui/icons";
 import { toast } from "sonner";
 import { useChatStore } from "@multica/core/chat";
+import { useMarkAllChatSessionsRead } from "@multica/core/chat/mutations";
 import { chatSessionsOptions } from "@multica/core/chat/queries";
 import { countUnreadChatMessages } from "@multica/core/chat/unread";
 import {
@@ -24,6 +25,7 @@ import {
   useInboxUnreadCount,
 } from "@multica/core/inbox/queries";
 import { useMarkAllInboxRead } from "@multica/core/inbox/mutations";
+import { useInboxSnoozeWake } from "@multica/core/inbox/use-snooze-wake";
 import { useSidebarTreeStore } from "@multica/core/issues/stores/sidebar-tree-store";
 import { resolveRailOrder, useRailOrderStore } from "@multica/core/navigation";
 import {
@@ -75,6 +77,7 @@ function useRailBadges(): Partial<Record<RailSpaceId, RailBadge>> {
   const p = useWorkspacePaths();
   const { pathname } = useNavigation();
   const inboxUnread = useInboxUnreadCount(wsId);
+  useInboxSnoozeWake(wsId);
   const inboxBadge = useSidebarTreeStore((s) => s.inboxSettings.railBadge);
 
   const { data: chatSessions = [] } = useQuery({
@@ -260,8 +263,15 @@ function RailSpaceMenu({
   const copyLink = async () => {
     if (await copyText(getShareableUrl(href))) toast.success(t(($) => $.rail.link_copied));
   };
+  const wsId = useCurrentWorkspace()?.id;
   const markAllRead = useMarkAllInboxRead();
-  const inboxUnread = useInboxUnreadCount(useCurrentWorkspace()?.id);
+  const inboxUnread = useInboxUnreadCount(wsId);
+  const markAllChatsRead = useMarkAllChatSessionsRead();
+  const { data: chatSessions = [] } = useQuery({
+    ...chatSessionsOptions(wsId ?? ""),
+    enabled: space === "chat" && !!wsId,
+  });
+  const unreadChatIds = chatSessions.filter((s) => (s.unread_count ?? 0) > 0).map((s) => s.id);
   const customOrder = useRailOrderStore((s) => s.order !== null);
   const setOrder = useRailOrderStore((s) => s.setOrder);
   return (
@@ -281,6 +291,21 @@ function RailSpaceMenu({
             <DropdownMenuItem
               onClick={() =>
                 markAllRead.mutate(undefined, {
+                  onError: () => toast.error(t(($) => $.rail.mark_all_read_failed)),
+                })
+              }
+            >
+              <CheckCheck />
+              {t(($) => $.rail.mark_all_read)}
+            </DropdownMenuItem>
+          </>
+        )}
+        {space === "chat" && unreadChatIds.length > 0 && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onClick={() =>
+                markAllChatsRead.mutate(unreadChatIds, {
                   onError: () => toast.error(t(($) => $.rail.mark_all_read_failed)),
                 })
               }

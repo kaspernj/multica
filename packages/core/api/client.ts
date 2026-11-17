@@ -1,3 +1,5 @@
+import type { ListWeixinInstallationsResponse, WeixinLogin } from "../types/weixin";
+import { ListWeixinInstallationsSchema, WeixinLoginSchema, EMPTY_WEIXIN_INSTALLATIONS, INVALID_WEIXIN_LOGIN } from "../weixin/schema";
 import type { ZodType } from "zod";
 import { AgentRuntimeSchema, EMPTY_RUNTIME } from "../runtimes/schema";
 import type { IssueWakeup, IssueWakeupInput, IssueWakeupSummaryRow, PausedWakeup, SystemWakeup, WakeupRun, WorkspaceSystemWakeup } from "../types/issue-wakeup";
@@ -57,6 +59,7 @@ import type {
   UpdateRuntimeProfileRequest,
   InboxItem,
   InboxWorkspaceUnread,
+  SnoozedInboxIssue,
   IssueSubscriber,
   IssueUnread,
   Comment,
@@ -101,12 +104,14 @@ import type {
   AssigneeFrequencyEntry,
   TaskMessagePayload,
   TaskContextReceiptResponse,
+  RuntimeRateLimitsResponse,
   Attachment,
   ChatSession,
   ChatPinnedAgent,
   ChatMessage,
   ChatMessagesPage,
   ChatDraftRestoresResponse,
+  ChatWakeup,
   ChatPendingTask,
   PrioritizeQueuedChatTaskResponse,
   PendingChatTasksResponse,
@@ -258,7 +263,6 @@ import type {
   BillingCheckoutSessionStatus,
   CreateBillingPortalSessionResponse,
   WorkspaceSubscriptionSummary,
-  IssueLimitUsage,
   WorkspaceSubscriptionPrices,
   CreateWorkspaceSubscriptionCheckoutRequest,
   CreateWorkspaceSubscriptionCheckoutResponse,
@@ -299,6 +303,7 @@ import {
   AttachmentResponseSchema,
   CancelTaskResponseSchema,
   ChatDraftRestoresResponseSchema,
+  ChatWakeupListSchema,
   ChatMessageListSchema,
   ChatMessagesPageSchema,
   ChatPendingTaskSchema,
@@ -381,6 +386,7 @@ import {
   RuntimeUsageByAgentListSchema,
   RuntimeUsageByHourListSchema,
   RuntimeUsageListSchema,
+  RuntimeRateLimitsResponseSchema,
   SearchIssuesResponseSchema,
   ProjectSchema,
   ArchiveProjectResponseSchema,
@@ -412,7 +418,6 @@ import {
   BillingCheckoutSessionStatusSchema,
   CreateBillingPortalSessionResponseSchema,
   WorkspaceSubscriptionSummarySchema,
-  IssueLimitUsageSchema,
   BatchUpdateIssuesResponseSchema,
   UNCONFIRMED_BATCH_UPDATE,
   WorkspaceSubscriptionPricesSchema,
@@ -457,6 +462,7 @@ import {
   EMPTY_CREATE_BILLING_PORTAL_SESSION_RESPONSE,
   EMPTY_CANCEL_TASK_RESPONSE,
   EMPTY_CHAT_DRAFT_RESTORES,
+  EMPTY_CHAT_WAKEUP_LIST,
   CreateFeedbackResponseSchema,
   EMPTY_CREATE_FEEDBACK_RESPONSE,
   InboxUnreadSummarySchema,
@@ -483,9 +489,11 @@ import {
   IssueInboxReadSchema,
   InboxDeleteSchema,
   InboxItemListSchema,
+  SnoozedInboxListSchema,
   ArchivedInboxPageSchema,
   ArchivedInboxFacetsSchema,
   EMPTY_INBOX_ITEMS,
+  EMPTY_SNOOZED_INBOX,
   NotificationPreferenceResponseSchema,
   EMPTY_NOTIFICATION_PREFERENCE_RESPONSE,
   LabelSchema,
@@ -665,6 +673,12 @@ function assertAgentConversationStartersWriteSupported(data: {
     throw new Error(
       "This server version does not support agent conversation starters. Update the server before saving them.",
     );
+  }
+}
+
+function assertWebhookPayloadConditionsWriteSupported(data: Pick<UpdateAutopilotTriggerRequest, "event_filters">): void {
+  if (data.event_filters?.some((filter) => filter.conditions?.length) && !configStore.getState().webhookPayloadConditionsSupported) {
+    throw new Error("This server version does not support webhook payload conditions. Update the server before saving them.");
   }
 }
 
@@ -1117,6 +1131,15 @@ export class ApiClient {
       return undefined as T;
     }
     return res.json() as Promise<T>;
+  }
+
+  /**
+   * A JSON request to an endpoint this client has no method for, with the
+   * same auth, workspace scoping and errors. For packages that own their
+   * endpoints (packages/ee); parse the result before using it.
+   */
+  request(path: string, init?: RequestInit): Promise<unknown> {
+    return this.fetch<unknown>(path, init);
   }
 
   // Auth
@@ -1800,17 +1823,6 @@ export class ApiClient {
     );
   }
 
-  async getIssueLimitUsage(): Promise<IssueLimitUsage | null> {
-    const raw = await this.fetch<unknown>("/api/issues/limit-usage");
-    if (raw == null) return null;
-    return parseWithFallback<IssueLimitUsage | null>(
-      raw,
-      IssueLimitUsageSchema,
-      null,
-      { endpoint: "GET /api/issues/limit-usage" },
-    );
-  }
-
   async deleteIssue(id: string): Promise<void> {
     await this.fetch(`/api/issues/${id}`, { method: "DELETE" });
   }
@@ -2035,6 +2047,15 @@ export class ApiClient {
       method: "POST",
       body: JSON.stringify(subscriberTarget(userId, userType)),
     });
+  }
+
+  /**
+   * Reverses the caller's own issue-only unsubscribe, restoring the
+   * subscription with its original reason (or the project subscription that
+   * covered it). Not a subscribe: that would make it a manual subscription.
+   */
+  async undoUnsubscribeFromIssue(issueId: string): Promise<void> {
+    await this.fetch(`/api/issues/${issueId}/unsubscribe/undo`, { method: "POST" });
   }
 
   // Agents
@@ -2712,6 +2733,16 @@ export class ApiClient {
     );
   }
 
+  async getRuntimeRateLimits(runtimeId: string): Promise<RuntimeRateLimitsResponse> {
+    const raw = await this.fetch<unknown>(`/api/runtimes/${runtimeId}/rate-limits`);
+    return parseWithFallback<RuntimeRateLimitsResponse>(
+      raw,
+      RuntimeRateLimitsResponseSchema,
+      { rate_limits: null },
+      { endpoint: "GET /api/runtimes/:id/rate-limits" },
+    );
+  }
+
   async getRuntimeUsage(
     runtimeId: string,
     params?: { days?: number; tz?: string },
@@ -3161,8 +3192,8 @@ export class ApiClient {
   }
 
   // Inbox
-  async listInbox(): Promise<InboxItem[]> {
-    const raw = await this.fetch<unknown>("/api/inbox");
+  async listInbox(signal?: AbortSignal): Promise<InboxItem[]> {
+    const raw = await this.fetch<unknown>("/api/inbox", { signal });
     return parseWithFallback(raw, InboxItemListSchema, EMPTY_INBOX_ITEMS, {
       endpoint: "GET /api/inbox",
     });
@@ -3219,12 +3250,32 @@ export class ApiClient {
     return this.fetch(`/api/inbox/${id}/unarchive`, { method: "POST" });
   }
 
+  // The viewer's snoozed issues, soonest back first (MUL-9333).
+  async listSnoozedInbox(signal?: AbortSignal): Promise<SnoozedInboxIssue[]> {
+    const raw = await this.fetch<unknown>("/api/inbox/snoozed", { signal });
+    return parseWithFallback(raw, SnoozedInboxListSchema, EMPTY_SNOOZED_INBOX, {
+      endpoint: "GET /api/inbox/snoozed",
+    });
+  }
+
+  // Snooze the item's issue until `until` (an ISO time). Snoozing a snoozed
+  // issue changes its time.
+  async snoozeInbox(id: string, until: string): Promise<{ issue_id: string; snoozed_until: string }> {
+    return this.fetch(`/api/inbox/${id}/snooze`, { method: "POST", body: JSON.stringify({ until }) });
+  }
+
+  // End the snooze on the item's issue. `read` restores it as read: undoing a
+  // snooze puts back the state it had.
+  async unsnoozeInbox(id: string, options: { read?: boolean } = {}): Promise<{ issue_id: string }> {
+    return this.fetch(`/api/inbox/${id}/unsnooze`, { method: "POST", body: JSON.stringify({ read: options.read ?? false }) });
+  }
+
   // Cross-workspace unread summary: one entry per workspace the user belongs
   // to that has unread inbox items. Backs the workspace-switcher dot for
   // OTHER workspaces. Schema-guarded so a contract drift hides the dot rather
   // than crashing the sidebar.
-  async getInboxUnreadSummary(): Promise<InboxWorkspaceUnread[]> {
-    const raw = await this.fetch<unknown>("/api/inbox/unread-summary");
+  async getInboxUnreadSummary(signal?: AbortSignal): Promise<InboxWorkspaceUnread[]> {
+    const raw = await this.fetch<unknown>("/api/inbox/unread-summary", { signal });
     return parseWithFallback(raw, InboxUnreadSummarySchema, EMPTY_INBOX_UNREAD_SUMMARY, {
       endpoint: "GET /api/inbox/unread-summary",
     });
@@ -4196,11 +4247,13 @@ export class ApiClient {
     sessionId: string,
     content: string,
     attachmentIds?: string[],
+    options?: { queue?: boolean },
   ): Promise<SendChatMessageResponse> {
     const body: {
       content: string;
+      steer: boolean;
       attachment_ids?: string[];
-    } = { content };
+    } = { content, steer: options?.queue !== true };
     if (attachmentIds && attachmentIds.length > 0) {
       body.attachment_ids = attachmentIds;
     }
@@ -4291,6 +4344,45 @@ export class ApiClient {
   async consumeChatDraftRestore(sessionId: string, restoreId: string): Promise<void> {
     await this.fetch(`/api/chat/sessions/${sessionId}/draft-restores/${restoreId}`, {
       method: "DELETE",
+    });
+  }
+
+  /** A 404 means the backend predates chat wakeups: nothing to show. */
+  async listChatSessionWakeups(sessionId: string): Promise<ChatWakeup[]> {
+    let raw: unknown;
+    try {
+      raw = await this.fetch<unknown>(`/api/chat/sessions/${sessionId}/wakeups`);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return [];
+      throw err;
+    }
+    return parseWithFallback(raw, ChatWakeupListSchema, EMPTY_CHAT_WAKEUP_LIST, {
+      endpoint: "GET /api/chat/sessions/{id}/wakeups",
+    });
+  }
+
+  async cancelChatWakeup(sessionId: string, wakeupId: string): Promise<void> {
+    await this.fetch(`/api/chat/sessions/${sessionId}/wakeups/${wakeupId}/cancel`, {
+      method: "POST",
+    });
+  }
+
+  async retryChatWakeup(sessionId: string, wakeupId: string): Promise<void> {
+    await this.fetch(`/api/chat/sessions/${sessionId}/wakeups/${wakeupId}/retry`, {
+      method: "POST",
+    });
+  }
+
+  async listMyChatWakeups(): Promise<ChatWakeup[]> {
+    let raw: unknown;
+    try {
+      raw = await this.fetch<unknown>(`/api/chat/my-wakeups`);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return [];
+      throw err;
+    }
+    return parseWithFallback(raw, ChatWakeupListSchema, EMPTY_CHAT_WAKEUP_LIST, {
+      endpoint: "GET /api/chat/my-wakeups",
     });
   }
 
@@ -5275,6 +5367,7 @@ export class ApiClient {
   }
 
   async createAutopilotTrigger(autopilotId: string, data: CreateAutopilotTriggerRequest): Promise<AutopilotTrigger> {
+    assertWebhookPayloadConditionsWriteSupported(data);
     return this.fetch(`/api/autopilots/${autopilotId}/triggers`, {
       method: "POST",
       body: JSON.stringify(data),
@@ -5282,6 +5375,7 @@ export class ApiClient {
   }
 
   async updateAutopilotTrigger(autopilotId: string, triggerId: string, data: UpdateAutopilotTriggerRequest): Promise<AutopilotTrigger> {
+    assertWebhookPayloadConditionsWriteSupported(data);
     return this.fetch(`/api/autopilots/${autopilotId}/triggers/${triggerId}`, {
       method: "PATCH",
       body: JSON.stringify(data),
@@ -6045,6 +6139,30 @@ export class ApiClient {
       EMPTY_REDEEM_WECOM_BINDING_TOKEN_RESPONSE,
       { endpoint: "POST /api/wecom/binding/redeem" },
     );
+  }
+
+  async listWeixinInstallations(workspaceId: string): Promise<ListWeixinInstallationsResponse> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/weixin/installations`);
+    return parseWithFallback(raw, ListWeixinInstallationsSchema, EMPTY_WEIXIN_INSTALLATIONS, { endpoint: "GET /api/workspaces/:id/weixin/installations" });
+  }
+
+  async beginWeixinLogin(workspaceId: string, agentId: string): Promise<WeixinLogin> {
+    const search = new URLSearchParams({ agent_id: agentId });
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/weixin/logins?${search}`, { method: "POST" });
+    return parseWithFallback(raw, WeixinLoginSchema, INVALID_WEIXIN_LOGIN, { endpoint: "POST /api/workspaces/:id/weixin/logins" });
+  }
+
+  async pollWeixinLogin(workspaceId: string, loginId: string, verifyCode = "", signal?: AbortSignal): Promise<WeixinLogin> {
+    const raw = await this.fetch<unknown>(`/api/workspaces/${workspaceId}/weixin/logins/${loginId}/poll`, { method: "POST", body: JSON.stringify({ verify_code: verifyCode }), signal });
+    return parseWithFallback(raw, WeixinLoginSchema, INVALID_WEIXIN_LOGIN, { endpoint: "POST /api/workspaces/:id/weixin/logins/:loginId/poll" });
+  }
+
+  async cancelWeixinLogin(workspaceId: string, loginId: string): Promise<void> {
+    await this.fetch(`/api/workspaces/${workspaceId}/weixin/logins/${loginId}`, { method: "DELETE" });
+  }
+
+  async deleteWeixinInstallation(workspaceId: string, installationId: string): Promise<void> {
+    await this.fetch(`/api/workspaces/${workspaceId}/weixin/installations/${installationId}`, { method: "DELETE" });
   }
 
   async listTelegramInstallations(
