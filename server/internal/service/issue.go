@@ -633,6 +633,18 @@ func (s *IssueService) createOnce(ctx context.Context, p IssueCreateParams, opts
 	if assignedTaskID.Valid && p.CreatorType == "member" {
 		s.TaskService.RecordHumanDelegation(ctx, attribution.DirectHumanRun(p.CreatorID, attribution.EvidenceIssueAssignment, issue.ID))
 	}
+	// A card created already assigned to an agent needs its reviewer wired at the
+	// same moment its run starts, or it can be implemented, merged and still never
+	// reach review. Best-effort: the issue is already committed, so a failure here
+	// is logged and the backfill pass re-arms the issue rather than losing it.
+	// The watcher is armed through the task service, so a service built without
+	// one — the same partial wiring publishIssueCreated skips its bus for — arms
+	// nothing.
+	if s.TaskService != nil {
+		if _, err := (&IssueWakeupService{Tasks: s.TaskService}).ArmContinuationReview(ctx, issue); err != nil {
+			slog.Warn("continuation review arm failed", "issue_id", util.UUIDToString(issue.ID), "error", err)
+		}
+	}
 
 	return IssueCreateResult{Issue: issue, Attachments: attachments, Labels: labels, AssignedTaskID: assignedTaskID}, nil
 }
