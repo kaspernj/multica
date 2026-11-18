@@ -1304,6 +1304,7 @@ type IssueWakeup struct {
 	MaxFires        pgtype.Int4        `json:"max_fires"`
 	FireCount       int32              `json:"fire_count"`
 	PausedReason    pgtype.Text        `json:"paused_reason"`
+	ReviewWatch     pgtype.Text        `json:"review_watch"`
 }
 
 type IssueWakeupReceipt struct {
